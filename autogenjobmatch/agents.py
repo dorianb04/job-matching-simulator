@@ -1,11 +1,25 @@
 """
-Agent definitions for the simulation.
+Agent definitions for the job matching simulation.
 """
 import autogen
+import random
 from typing import Dict, Any, List, Optional
-from .monitoring import AgentOpsTracker
 
-def get_llm_config(api_key: str, model: str = "llama3-70b-8192") -> Dict[str, Any]:
+from .config import (
+    GROQ_MODEL,
+    DATA_SCIENCE_SKILLS,
+    SECTORS,
+    INITIAL_ENERGY,
+    INTERVIEW_ATTITUDES,
+    INTERVIEW_STRATEGIES,
+    CODE_EXECUTION_CONFIG,
+    EVALUATION_WEIGHTS,
+    CANDIDATE_EVALUATION_WEIGHTS,
+    CANDIDATE_PROMPT,
+    COMPANY_PROMPT
+)
+
+def get_llm_config(api_key: str, model: str = GROQ_MODEL) -> Dict[str, Any]:
     """
     Get LLM configuration for Autogen.
     
@@ -22,9 +36,11 @@ def get_llm_config(api_key: str, model: str = "llama3-70b-8192") -> Dict[str, An
                 "model": model,
                 "api_key": api_key,
                 "base_url": "https://api.groq.com/openai/v1",
-            }
+                "price" : [0, 0]
+            },
         ],
         "temperature": 0.7,
+        
     }
 
 def create_user_proxy(name: str = "user_proxy") -> autogen.UserProxyAgent:
@@ -37,8 +53,6 @@ def create_user_proxy(name: str = "user_proxy") -> autogen.UserProxyAgent:
     Returns:
         UserProxyAgent instance
     """
-    from .config import CODE_EXECUTION_CONFIG
-    
     return autogen.UserProxyAgent(
         name=name,
         human_input_mode="NEVER",
@@ -53,8 +67,7 @@ class CandidateAgent:
         self, 
         candidate_id: int, 
         profile: Dict[str, Any], 
-        llm_config: Dict[str, Any],
-        tracker: Optional[AgentOpsTracker] = None
+        llm_config: Dict[str, Any]
     ):
         """
         Initialize a candidate agent.
@@ -63,40 +76,28 @@ class CandidateAgent:
             candidate_id: Unique identifier
             profile: Candidate profile data
             llm_config: LLM configuration
-            tracker: AgentOps tracker
         """
         self.id = candidate_id
         self.profile = profile
-        self.tracker = tracker
+        
+        # Create safe agent name (no spaces)
+        safe_name = f"candidate_{candidate_id}"
         
         # Create the Autogen agent
         self.agent = autogen.AssistantAgent(
-            name=f"candidate_{candidate_id}",
+            name=safe_name,
             llm_config=llm_config,
             system_message=self._create_system_message()
         )
-        
-        # Track agent creation
-        if tracker:
-            tracker.track_event("agent_created", {
-                "agent_id": f"candidate_{candidate_id}",
-                "agent_type": "candidate",
-                "profile": profile
-            })
     
     def _create_system_message(self) -> str:
         """Create the system message for the agent."""
-        return f"""
-        You are a job candidate with ID {self.id}.
-        
-        Your profile:
-        - Energy: {self.profile['energy']}
-        - Motivation: {self.profile['motivation']}
-        - Money importance: {self.profile['money_importance']}
-        - Skills: {self.profile['skills']}
-        
-        You're looking for a job that matches your skills and preferences.
-        """
+        return CANDIDATE_PROMPT.format(
+            energy=self.profile.get("energy", INITIAL_ENERGY),
+            motivation=", ".join([f"{k}: {v}" for k, v in self.profile.get("motivation", {}).items()]),
+            money_importance=self.profile.get("money_importance", 0.5),
+            skills=", ".join([f"{k}: {v}" for k, v in self.profile.get("skills", {}).items()])
+        )
     
     def evaluate_job_offer(self, job_offer: Dict[str, Any]) -> float:
         """
@@ -108,8 +109,8 @@ class CandidateAgent:
         Returns:
             Score between 0 and 1
         """
-        # Simple scoring logic (to be expanded)
-        score = 0.0
+        # Get weights
+        weights = EVALUATION_WEIGHTS
         
         # Check for matching skills
         required_skills = job_offer.get("required_skills", [])
@@ -119,28 +120,78 @@ class CandidateAgent:
         
         # Consider sector motivation
         sector = job_offer.get("sector", "")
-        sector_motivation = self.profile.get("motivation", {}).get(sector, 0)
+        sector_motivation = self.profile.get("motivation", {}).get(sector, 0) / 10  # Normalize to 0-1
         
         # Consider salary
-        salary = job_offer.get("salary", 0)
+        salary_range = job_offer.get("salary_range", (0, 0))
+        avg_salary = sum(salary_range) / 2 if salary_range else 0
+        salary_score = min(avg_salary, 150000) / 150000  # Normalize to 0-1
         money_importance = self.profile.get("money_importance", 0.5)
         
-        # Combine factors
+        # Combine factors using weights
         score = (
-            0.4 * skill_match +
-            0.3 * (sector_motivation / 10) +
-            0.3 * (min(salary, 100000) / 100000) * money_importance
+            weights["skill_match"] * skill_match +
+            weights["sector_motivation"] * sector_motivation +
+            weights["salary_match"] * salary_score * money_importance
         )
         
-        # Track evaluation
-        if self.tracker:
-            self.tracker.track_event("job_offer_evaluated", {
-                "candidate_id": self.id,
-                "job_id": job_offer.get("id"),
-                "score": score
-            })
-        
         return score
+    
+    def create_cv(self, truth_level: float = 1.0) -> Dict[str, Any]:
+        """
+        Create a CV, potentially with exaggerations.
+        
+        Args:
+            truth_level: How truthful to be (1.0 = completely honest)
+            
+        Returns:
+            CV data
+        """
+        skills = {}
+        
+        # Copy skills, potentially with exaggerations
+        for skill, level in self.profile.get("skills", {}).items():
+            if random.random() > truth_level:
+                # Exaggerate skill level (but not beyond 10)
+                exaggerated_level = min(level + random.randint(1, 3), 10)
+                skills[skill] = exaggerated_level
+            else:
+                skills[skill] = level
+        
+        return {
+            "candidate_id": self.id,
+            "skills": skills,
+            "truth_level": truth_level,
+            "expected_salary": random.randint(50000, 150000)
+        }
+    
+    def attend_interview(self, strategy: str = None, attitude: str = None) -> Dict[str, Any]:
+        """
+        Prepare for interview with a strategy.
+        
+        Args:
+            strategy: Interview strategy (Formal/Casual)
+            attitude: Interview attitude (Humble/Confident)
+            
+        Returns:
+            Interview preparation data
+        """
+        # Default strategy and attitude if not specified
+        if strategy is None:
+            strategy = random.choice(INTERVIEW_STRATEGIES)
+        
+        if attitude is None:
+            attitude = random.choice(INTERVIEW_ATTITUDES)
+        
+        # Consume energy
+        self.profile["energy"] = max(0, self.profile.get("energy", 0) - 1)
+        
+        return {
+            "candidate_id": self.id,
+            "strategy": strategy,
+            "attitude": attitude,
+            "energy": self.profile["energy"]
+        }
 
 class CompanyAgent:
     """Agent representing a company."""
@@ -149,8 +200,7 @@ class CompanyAgent:
         self, 
         company_id: int, 
         profile: Dict[str, Any], 
-        llm_config: Dict[str, Any],
-        tracker: Optional[AgentOpsTracker] = None
+        llm_config: Dict[str, Any]
     ):
         """
         Initialize a company agent.
@@ -159,40 +209,28 @@ class CompanyAgent:
             company_id: Unique identifier
             profile: Company profile data
             llm_config: LLM configuration
-            tracker: AgentOps tracker
         """
         self.id = company_id
         self.profile = profile
-        self.tracker = tracker
+        
+        # Create safe agent name (no spaces)
+        safe_name = f"company_{company_id}"
         
         # Create the Autogen agent
         self.agent = autogen.AssistantAgent(
-            name=f"company_{company_id}",
+            name=safe_name,
             llm_config=llm_config,
             system_message=self._create_system_message()
         )
-        
-        # Track agent creation
-        if tracker:
-            tracker.track_event("agent_created", {
-                "agent_id": f"company_{company_id}",
-                "agent_type": "company",
-                "profile": profile
-            })
     
     def _create_system_message(self) -> str:
         """Create the system message for the agent."""
-        return f"""
-        You are a company with ID {self.id}.
-        
-        Your profile:
-        - Name: {self.profile['name']}
-        - Sector: {self.profile['sector']}
-        - Budget: {self.profile['budget']}
-        - Required skills: {self.profile['required_skills']}
-        
-        You're looking to hire candidates that match your requirements.
-        """
+        return COMPANY_PROMPT.format(
+            sector=self.profile.get("sector", "Technology"),
+            name=self.profile.get("name", f"Company {self.id}"),
+            budget=self.profile.get("budget", 100000),
+            skills=", ".join(self.profile.get("required_skills", []))
+        )
     
     def evaluate_candidate(self, candidate_profile: Dict[str, Any]) -> float:
         """
@@ -204,8 +242,8 @@ class CompanyAgent:
         Returns:
             Score between 0 and 1
         """
-        # Simple scoring logic (to be expanded)
-        score = 0.0
+        # Get weights
+        weights = CANDIDATE_EVALUATION_WEIGHTS
         
         # Check for matching skills
         required_skills = self.profile.get("required_skills", [])
@@ -218,25 +256,66 @@ class CompanyAgent:
         expected_salary = candidate_profile.get("expected_salary", budget)
         budget_fit = 1.0 if expected_salary <= budget else budget / expected_salary
         
-        # Combine factors
-        score = 0.7 * skill_match + 0.3 * budget_fit
-        
-        # Track evaluation
-        if self.tracker:
-            self.tracker.track_event("candidate_evaluated", {
-                "company_id": self.id,
-                "candidate_id": candidate_profile.get("id"),
-                "score": score
-            })
+        # Combine factors using weights
+        score = (
+            weights["skill_match"] * skill_match +
+            weights["budget_fit"] * budget_fit
+        )
         
         return score
+    
+    def select_candidates(self, applications: List[Dict[str, Any]], num_slots: int = 2) -> List[int]:
+        """
+        Select candidates for interviews.
+        
+        Args:
+            applications: List of applications
+            num_slots: Number of interview slots
+            
+        Returns:
+            List of selected candidate IDs
+        """
+        # Filter applications for this company
+        company_applications = [
+            app for app in applications if app.get("company_id") == self.id
+        ]
+        
+        # If fewer applications than slots, select all
+        if len(company_applications) <= num_slots:
+            return [app.get("candidate_id") for app in company_applications]
+        
+        # Otherwise, select top scoring applications
+        company_applications.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return [app.get("candidate_id") for app in company_applications[:num_slots]]
+    
+    def make_hiring_decision(self, interview_result: Dict[str, Any]) -> bool:
+        """
+        Make a hiring decision based on an interview.
+        
+        Args:
+            interview_result: Results from the interview
+            
+        Returns:
+            Whether to hire the candidate
+        """
+        # This is a simplified implementation
+        # In a real system, you would analyze the interview responses
+        
+        # For now, just make a random decision weighted by the number of messages
+        # This simulates longer, more engaged interviews having better chances
+        num_messages = len(interview_result.get("messages", []))
+        base_chance = 0.5
+        
+        # Adjust chance based on number of messages (more messages = better chance)
+        adjusted_chance = min(0.8, base_chance + (num_messages / 20))
+        
+        return random.random() < adjusted_chance
 
 def create_interviewer_agent(
     company_name: str,
     position: str,
     style: str,
-    llm_config: Dict[str, Any],
-    tracker: Optional[AgentOpsTracker] = None
+    llm_config: Dict[str, Any]
 ) -> autogen.AssistantAgent:
     """
     Create an interviewer agent.
@@ -246,7 +325,6 @@ def create_interviewer_agent(
         position: Job position
         style: Interview style
         llm_config: LLM configuration
-        tracker: AgentOps tracker
         
     Returns:
         Autogen assistant agent
@@ -256,7 +334,7 @@ def create_interviewer_agent(
     safe_company_name = company_name.replace(" ", "_").replace("-", "").replace("/", "")
     safe_position = position.replace(" ", "_").replace("-", "").replace("/", "")
     
-    agent_name = f"interviewer_{safe_company_name}_{safe_position}"
+    agent_name = f"interviewer_{safe_company_name}_{safe_position}"[:50]  # Limit length
     
     system_message = f"""
     You are an interviewer at {company_name}.
@@ -271,15 +349,5 @@ def create_interviewer_agent(
         llm_config=llm_config,
         system_message=system_message
     )
-    
-    # Track agent creation
-    if tracker:
-        tracker.track_event("agent_created", {
-            "agent_id": agent_name,
-            "agent_type": "interviewer",
-            "company": company_name,
-            "position": position,
-            "style": style
-        })
     
     return interviewer
