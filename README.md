@@ -26,7 +26,7 @@ The simulation leverages Autogen and large language models to create strategic a
 ```bash
 # Clone the repository
 git clone https://github.com/dorianb04/job-matching-simulator.git
-cd autogenjobmatch
+cd job-matching-simulator
 
 # Install dependencies
 pip install -r requirements.txt
